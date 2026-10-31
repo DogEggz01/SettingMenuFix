@@ -32,12 +32,14 @@ namespace SettingMenuFix
     {
         public const string Guid = "DogEggz.SettingMenuFix";
         public const string Name = "Setting Menu Fix";
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
         internal const string CigarGuid = "DogEggz.Cigar";
         internal const string NoBloomGuid = "com.app24.nobloom";
         internal static Plugin Instance;
         internal static ManualLogSource Log;
-        internal bool Bloom { get; private set; }
+        // The game's own bloom intensity setting (0.40) decides Bloom: only "off" counts as Bloom off.
+        internal bool Bloom => BloomOn(Settings.bloomIntensity);
+        internal static bool BloomOn(float intensity) => intensity > 0.01f; // GPButtonBloomIntensity shows "off" at 0.01 or below
         internal readonly PipeVisualCharge PipeVisual = new PipeVisualCharge();
         private PlayerTobacco visualOwner;
         internal readonly DisplaySettings Display = new DisplaySettings();
@@ -46,7 +48,7 @@ namespace SettingMenuFix
         private Harmony harmony;
         private CigarDoses cigars;
         private PostProcessingProfile profile;
-        private const string BloomKey = Guid + ".Bloom";
+        private const string BloomKey = Guid + ".Bloom"; // 1.0.0's own Bloom preference, moved to the game's setting once
         private bool quitting;
 
         private void Awake()
@@ -54,8 +56,15 @@ namespace SettingMenuFix
             Instance = this;
             Log = Logger;
             bool legacyBloom = MenuPreferences.ConsumeLegacy(Config);
-            Bloom = PlayerPrefs.GetInt(BloomKey, legacyBloom ? 1 : 0) != 0;
-            PlayerPrefs.SetInt(BloomKey, Bloom ? 1 : 0);
+            bool hasKey = PlayerPrefs.HasKey(BloomKey);
+            if (MenuPreferences.WasBloomOff(hasKey, hasKey ? PlayerPrefs.GetInt(BloomKey) : 1, legacyBloom))
+            {
+                // Set both: SettingsLoader.Awake may already have read PlayerPrefs.
+                Settings.bloomIntensity = 0f;
+                PlayerPrefs.SetFloat("bloomIntensity", 0f);
+                Logger.LogInfo("Moved this mod's Bloom off preference to the game's bloom intensity: off.");
+            }
+            PlayerPrefs.DeleteKey(BloomKey);
             PlayerPrefs.Save();
             harmony = new Harmony(Guid);
             try
@@ -85,13 +94,6 @@ namespace SettingMenuFix
                 if (list.gameObject.scene.IsValid()) NativeSettingsMenu.TryAttach(list);
         }
 
-        internal void SetBloom(bool enabled)
-        {
-            Bloom = enabled;
-            PlayerPrefs.SetInt(BloomKey, enabled ? 1 : 0);
-            PlayerPrefs.Save();
-            RefreshEffectsNow();
-        }
         internal void ResetVisual() { PipeVisual.Reset(); visualOwner = null; }
         internal void PrepareVisual(PlayerTobacco tobacco)
         {
@@ -151,7 +153,7 @@ namespace SettingMenuFix
             if (suspendedNoBloom.Count > 0)
             {
                 harmony.Unpatch(getter, HarmonyPatchType.Prefix, NoBloomGuid);
-                Logger.LogInfo("Suspended No Bloom's bloom prefix while the Bloom setting is managed.");
+                Logger.LogInfo("Suspended No Bloom's bloom prefix: the game's bloom intensity setting controls bloom.");
             }
         }
 
@@ -176,13 +178,19 @@ namespace SettingMenuFix
     internal static class TobaccoBasePatch
     {
         [HarmonyPrefix]
-        private static void Prefix(PlayerTobacco __instance)
+        private static void Prefix(PlayerTobacco __instance, out float __state)
         {
+            __state = __instance.queuedBlack;
             Plugin.Instance?.PrepareVisual(__instance);
             Plugin.Instance?.PipeVisual.Tick(Time.deltaTime);
         }
         [HarmonyPostfix, HarmonyBefore(Plugin.CigarGuid)]
-        private static void Postfix(PlayerTobacco __instance) => Plugin.Instance?.ApplyEffects(__instance, false);
+        private static void Postfix(PlayerTobacco __instance, float __state)
+        {
+            // Black charge the game moved this frame from its food queue (the strange mushroom, PlayerTobacco.EatStrange).
+            Plugin.Instance?.PipeVisual.Add(__state - __instance.queuedBlack);
+            Plugin.Instance?.ApplyEffects(__instance, false);
+        }
     }
 
     [HarmonyPatch(typeof(PlayerTobacco), nameof(PlayerTobacco.Smoke))]
@@ -209,6 +217,13 @@ namespace SettingMenuFix
         [HarmonyPostfix]
         private static void Postfix(ref bool __result)
         { if (Plugin.Instance != null && !Plugin.Instance.Bloom) __result = false; }
+    }
+
+    [HarmonyPatch(typeof(GPButtonBloomIntensity), nameof(GPButtonBloomIntensity.OnActivate))]
+    internal static class BloomIntensityPatch
+    {
+        // The game's bloom button in the paused menu: apply the contrast at once.
+        private static void Postfix() => Plugin.Instance?.RefreshEffectsNow();
     }
 
     [HarmonyPatch(typeof(Settings), nameof(Settings.ApplyCurrentResolution))]
@@ -261,6 +276,9 @@ namespace SettingMenuFix
 {
     internal static class MenuPreferences
     {
+        // 1.0.0's Bloom was off: its PlayerPrefs key, or before that the old configuration entry.
+        internal static bool WasBloomOff(bool hasKey, int value, bool legacyBloom) => hasKey ? value == 0 : !legacyBloom;
+
         internal static bool ConsumeLegacy(ConfigFile config)
         {
             bool save = config.SaveOnConfigSet;
@@ -299,6 +317,8 @@ namespace SettingMenuFix
         { if (active) Charge = Math.Max(0f, Charge - Math.Max(0f, seconds) * 0.5f); }
         internal void Inhale(float seconds)
         { if (active) Charge += Math.Max(0f, seconds) * 2f; }
+        internal void Add(float charge)
+        { if (active && charge > 0f) Charge += charge; }
     }
 }
 
@@ -808,7 +828,7 @@ namespace SettingMenuFix
         private readonly ListViewport viewport = new ListViewport();
         private readonly NativeMenuButton[] rows = new NativeMenuButton[ListViewport.Capacity];
         private ResolutionsUI list;
-        private TextMesh labels, resolutionText, rateText, bloomText, rangeText;
+        private TextMesh labels, resolutionText, rateText, rangeText;
         private GPButtonWindowMode window;
         private string originalLabels;
         private NativeMenuButton previous, next;
@@ -828,23 +848,22 @@ namespace SettingMenuFix
             if (existing != null) return existing.ready;
             Transform graphics = list.transform.parent;
             var labels = graphics.GetComponentsInChildren<TextMesh>(true).FirstOrDefault(t => t.text.Contains("DISPLAY\n") && t.text.Contains("GRAPHICS\n\n"));
-            var bloomTemplate = graphics.GetComponentsInChildren<GPButtonSettingsCheckbo>(true).FirstOrDefault(b => b.setting == "ambientOcclusion");
             var opener = graphics.GetComponentsInChildren<GPButtonResolutionUI>(true).FirstOrDefault(b => b.openList && b.list == list.gameObject);
             var window = graphics.GetComponentInChildren<GPButtonWindowMode>(true);
             var target = graphics.GetComponentInChildren<GPButtonTargetFramerate>(true);
             var vsync = graphics.GetComponentsInChildren<GPButtonSettingsCheckbo>(true).FirstOrDefault(b => b.setting == "vsync");
-            if (labels == null || bloomTemplate == null || opener == null || window == null || target == null || vsync == null ||
+            if (labels == null || opener == null || window == null || target == null || vsync == null ||
                 list.buttonPrefab == null || !labels.text.Contains("screen resolution\nwindow mode\ntarget framerate\nenable v-sync\n\n\n"))
             {
-                Plugin.Log.LogWarning("Native graphics sheet does not match Sailwind 0.38.1; retaining its original controls.");
+                Plugin.Log.LogWarning("Native graphics sheet does not match Sailwind 0.40; retaining its original controls.");
                 return false;
             }
             var menu = graphics.gameObject.AddComponent<NativeSettingsMenu>();
             try
             {
-                menu.Initialize(list, labels, bloomTemplate, opener, window, target, vsync);
+                menu.Initialize(list, labels, opener, window, target, vsync);
                 Menus.Add(menu);
-                Plugin.Log.LogInfo("Attached native settings sheet: Bloom, resolution and refresh-rate selectors (8 rows).");
+                Plugin.Log.LogInfo("Attached native settings sheet: resolution and refresh-rate selectors (8 rows).");
                 return true;
             }
             catch (Exception error)
@@ -856,7 +875,7 @@ namespace SettingMenuFix
             }
         }
 
-        private void Initialize(ResolutionsUI source, TextMesh text, GPButtonSettingsCheckbo checkbox,
+        private void Initialize(ResolutionsUI source, TextMesh text,
             GPButtonResolutionUI opener, GPButtonWindowMode windowButton, GPButtonTargetFramerate target, GPButtonSettingsCheckbo vsync)
         {
             list = source;
@@ -866,8 +885,7 @@ namespace SettingMenuFix
             originalButtons = list.buttons;
             resolutionText = opener.GetComponentInChildren<TextMesh>(true);
             labels.text = labels.text.Replace("screen resolution\nwindow mode\ntarget framerate\nenable v-sync\n\n\n",
-                "screen resolution\nrefresh rate\nwindow mode\ntarget framerate\nenable v-sync\n\n")
-                .Replace("GRAPHICS\n\n", "GRAPHICS\nBloom\n");
+                "screen resolution\nrefresh rate\nwindow mode\ntarget framerate\nenable v-sync\n\n");
             MoveDown(window.transform);
             MoveDown(target.transform);
             MoveDown(vsync.transform);
@@ -875,15 +893,6 @@ namespace SettingMenuFix
             var refresh = CopyButton(opener.gameObject, opener.transform.parent, "refresh rate", () => Open(true));
             refresh.transform.localPosition = opener.transform.localPosition + Vector3.down * 0.02f;
             rateText = refresh.Text;
-            var bloom = CopyButton(checkbox.gameObject, transform, "Bloom", () =>
-            {
-                Plugin.Instance.SetBloom(!Plugin.Instance.Bloom);
-                Plugin.Instance.RefreshEffectsNow();
-            });
-            var bloomPosition = checkbox.transform.localPosition;
-            bloomPosition.y = 0f;
-            bloom.transform.localPosition = bloomPosition;
-            bloomText = bloom.Text;
 
             list.gameObject.SetActive(false);
             foreach (Transform child in list.transform)
@@ -1116,7 +1125,6 @@ namespace SettingMenuFix
             var display = Plugin.Instance.Display;
             resolutionText.text = display.Selected.SizeText;
             rateText.text = display.Selected.RateText;
-            bloomText.text = Plugin.Instance.Bloom ? "X" : "";
             window.text.text = display.WindowLabel;
         }
 
